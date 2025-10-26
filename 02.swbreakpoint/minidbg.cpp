@@ -1,153 +1,19 @@
-#include <cerrno>
-#include <csignal>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <iostream>
-#include <sstream>
-#include <string>
-#include <vector>
+#include "pch.h"
 
-#include <sys/ptrace.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-// Using std::getline for a simple REPL; no external linenoise dependency.
-
-class debugger {
-public:
-    debugger(std::string prog_name, pid_t pid)
-        : m_prog_name{std::move(prog_name)}, m_pid{pid} {}
-
-    void run();
-
-private:
-    void handle_command(const std::string &line);
-    void continue_execution();
-
-    static std::vector<std::string> split(const std::string &s, char delimiter);
-    static bool is_prefix(const std::string &s, const std::string &of);
-
-private:
-    std::string m_prog_name;
-    pid_t m_pid;
-};
-
-void debugger::run() {
-    // Wait for the child to stop on its initial SIGTRAP after execve
-    int wait_status = 0;
-    if (waitpid(m_pid, &wait_status, 0) < 0) {
-        perror("waitpid (initial)");
-        return;
+static inline long read_word(pid_t pid, std::intptr_t addr){
+    errno = 0;
+    long data = ptrace(PTRACE_PEEKDATA, pid, reinterpret_cast<void*>(addr), nullptr);
+    if (data == -1 && errno){
+        perror("ptrace(PEEKDATA)");
     }
-
-    if (WIFEXITED(wait_status)) {
-        std::cerr << "[!] Process exited before we could attach (status=" << WEXITSTATUS(wait_status) << ")\n";
-        return;
-    }
-
-    // Set a couple of helpful ptrace options early
-    long r = ptrace(PTRACE_SETOPTIONS, m_pid, 0,
-                    PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD);
-    if (r == -1) {
-        perror("ptrace(PTRACE_SETOPTIONS)");
-    }
-
-    // Simple REPL using std::getline (portable, no extra dependency)
-    for (std::string cmdline; std::cout << "minidbg> " && std::getline(std::cin, cmdline);) {
-        if (!cmdline.empty()) handle_command(cmdline);
+    return data;
+}
+static inline void write_word(pid_t pid, std::intptr_t addr, long data){
+    if (ptrace(PTRACE_POKEDATA, pid, reinterpret_cast<void*>(addr), reinterpret_cast<void*>(data)) == -1){
+        perror("ptrace(POKEDATA)");
     }
 }
 
-void debugger::handle_command(const std::string &line) {
-    auto args = split(line, ' ');
-    if (args.empty()) return;
-
-    const auto &command = args[0];
-
-    if (is_prefix(command, std::string("continue"))) {
-        continue_execution();
-    } else if (command == "quit" || command == "q") {
-        std::cout << "bye\n";
-        // Let the loop in run() end by simulating EOF on stdin if needed.
-        // Here we simply send SIGKILL to the child and return; real dbg would detach.
-        kill(m_pid, SIGKILL);
-        // nothing else to do; user can Ctrl+D to exit the REPL
-    } else {
-        std::cerr << "Unknown command: " << command << "\n";
-    }
-}
-
-std::vector<std::string> debugger::split(const std::string &s, char delimiter) {
-    std::vector<std::string> out{};
-    std::stringstream ss{s};
-    std::string item;
-
-    while (std::getline(ss, item, delimiter)) {
-        if (!item.empty()) out.push_back(item);
-    }
-    return out;
-}
-
-bool debugger::is_prefix(const std::string &s, const std::string &of) {
-    // Returns true if s is a prefix of of, so "cont" matches "continue"
-    if (s.size() > of.size()) return false;
-    return std::equal(s.begin(), s.end(), of.begin());
-}
-
-void debugger::continue_execution() {
-    if (ptrace(PTRACE_CONT, m_pid, nullptr, nullptr) == -1) {
-        perror("ptrace(PTRACE_CONT)");
-        return;
-    }
-
-    int wait_status = 0;
-    if (waitpid(m_pid, &wait_status, 0) < 0) {
-        perror("waitpid (continue)");
-        return;
-    }
-
-    if (WIFSTOPPED(wait_status)) {
-        int sig = WSTOPSIG(wait_status);
-        std::cout << "[stopped] signal " << sig << "\n";
-    } else if (WIFEXITED(wait_status)) {
-        std::cout << "[exit] status " << WEXITSTATUS(wait_status) << "\n";
-    } else if (WIFSIGNALED(wait_status)) {
-        std::cout << "[killed] by signal " << WTERMSIG(wait_status) << "\n";
-    }
-}
-
-class breakpoint {
-    public:
-        breakpoint(pid_t pid, std::intptr_t addr):m_pid{pid}, m_addr{addr}, m_enabled{false}, m_saved_data{}
-            {}
-        void enable();
-        void disable();
-
-        auto is_enabled() const -> bool {return m_enabled;}
-        auto get_address() const-> std::intptr_t {return m_addr;}
-
-    private:
-        pid_t m_pid;
-        std::intptr_t m_addr;
-        bool m_enabled;
-        uint8_t m_saved_data; //data which used to be at the breakpoint address
-}
-
-void breakpoint::enable(){
-    auto data = ptrace(PTRACE_PEEKDATA, m_pid, m_addr, nullptr);
-    m_saved_data = static_cast<uint8_t>(data & 0xff); // save bottom byte
-    uint64_t int3 = 0xcc;
-    uint64_t data_with_int3 = ((data & ~0xff) | int3); // set bottom byte to 0xcc
-    ptrace(PTRACE_POKEDATA, m_pid, m_addr, data_with_int3);
-
-    m_enabled = true;
-}
-
-void breakpoint::disable(){
-    auto data = ptrace(PTRACE_PEEKDATA, m_pid, m_addr, nullptr);
-}
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -165,6 +31,10 @@ int main(int argc, char *argv[]) {
 
     if (pid == 0) {
         // Child: become tracee and exec the target
+        if (personality(ADDR_NO_RANDOMIZE) == -1) {
+            perror("personality(ADDR_NO_RANDOMIZE)");
+            _exit(1);
+        }
         if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == -1) {
             perror("ptrace(PTRACE_TRACEME)");
             _exit(1);
