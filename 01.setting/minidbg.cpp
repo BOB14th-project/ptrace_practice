@@ -15,6 +15,22 @@
 
 // Using std::getline for a simple REPL; no external linenoise dependency.
 
+/*
+ * minidbg: 작은 ptrace 기반 디버거 예제
+ *
+ * 전체 흐름(요약):
+ *  - 부모 프로세스는 디버거 역할을 합니다.
+ *  - 자식 프로세스는 PTRACE_TRACEME를 호출하여 트레이스 대상(tracee)이
+ *    되고, 이어서 execvp()로 실제 디버깅 대상 바이너리로 교체됩니다.
+ *    exec 후에 발생하는 post-exec SIGTRAP는 부모가 waitpid()로 관찰합니다.
+ *  - 부모는 자식의 초기 SIGTRAP을 기다린 뒤 ptrace 옵션을 설정
+ *    (예: PTRACE_O_EXITKILL)하고 간단한 REPL을 통해 명령을 받습니다.
+ *
+ * 파일 내 주요 지점에는 다음과 같은 설명 주석을 추가하여 코드의 흐름을
+ * 이해하기 쉽게 했습니다: 프로세스 분기, 초기 정지(post-exec SIGTRAP),
+ * PTRACE 옵션 설정, REPL/명령 처리, continue 후 상태 확인 등.
+ */
+
 class debugger {
 public:
     debugger(std::string prog_name, pid_t pid)
@@ -41,20 +57,26 @@ void debugger::run() {
         perror("waitpid (initial)");
         return;
     }
-
+    // 자식이 즉시 종료한 경우(예: execvp 실패)에는 에러를 출력하고 종료합니다.
     if (WIFEXITED(wait_status)) {
         std::cerr << "[!] Process exited before we could attach (status=" << WEXITSTATUS(wait_status) << ")\n";
         return;
     }
 
-    // Set a couple of helpful ptrace options early
+    // 부모는 이제 자식의 post-exec 정지(보통 SIGTRAP)를 관찰한 상태입니다.
+    // 아래 ptrace 옵션들을 설정하면 디버깅 동작을 더 깔끔하게 받을 수 있습니다:
+    //  - PTRACE_O_EXITKILL: 디버거가 죽으면 tracee도 함께 종료되도록 보장
+    //  - PTRACE_O_TRACESYSGOOD: 시스템콜 정지를 다른 정지와 구분하기 쉽게 함
     long r = ptrace(PTRACE_SETOPTIONS, m_pid, 0,
                     PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD);
     if (r == -1) {
         perror("ptrace(PTRACE_SETOPTIONS)");
     }
 
-    // Simple REPL using std::getline (portable, no extra dependency)
+    // 간단한 REPL을 실행하여 사용자의 디버거 명령을 입력받습니다.
+    // 여기서는 외부 readline 라이브러리 대신 표준 입력의 std::getline을
+    // 사용합니다. 입력은 split()으로 파싱되어 handle_command()로 전달됩니다.
+    // 현재는 `continue`와 `quit` 정도만 구현되어 있습니다.
     for (std::string cmdline; std::cout << "minidbg> " && std::getline(std::cin, cmdline);) {
         if (!cmdline.empty()) handle_command(cmdline);
     }
@@ -69,11 +91,12 @@ void debugger::handle_command(const std::string &line) {
     if (is_prefix(command, std::string("continue"))) {
         continue_execution();
     } else if (command == "quit" || command == "q") {
-        std::cout << "bye\n";
-        // Let the loop in run() end by simulating EOF on stdin if needed.
-        // Here we simply send SIGKILL to the child and return; real dbg would detach.
-        kill(m_pid, SIGKILL);
-        // nothing else to do; user can Ctrl+D to exit the REPL
+    // quit: 디버깅 대상 프로세스를 종료하고 REPL을 빠져나옵니다.
+    // 실제 디버거라면 여기서 detach할 수 있지만, 이 예제는 단순히
+    // 자식을 kill하여 백그라운드에 남지 않도록 합니다.
+    std::cout << "bye\n";
+    kill(m_pid, SIGKILL);
+    // 추가 작업은 없고, 사용자는 Ctrl+D로 REPL을 종료할 수 있습니다.
     } else {
         std::cerr << "Unknown command: " << command << "\n";
     }
@@ -101,7 +124,9 @@ void debugger::continue_execution() {
         perror("ptrace(PTRACE_CONT)");
         return;
     }
-
+    // continue로 실행을 재개한 뒤 다시 자식이 멈추거나 종료될 때까지
+    // 대기하고 간단한 상태 메시지를 출력합니다. 실제 디버거라면 이
+    // 시점에 레지스터나 메모리 검사, 브레이크포인트 처리 등을 하게 됩니다.
     int wait_status = 0;
     if (waitpid(m_pid, &wait_status, 0) < 0) {
         perror("waitpid (continue)");
