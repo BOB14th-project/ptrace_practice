@@ -10,7 +10,12 @@
 class debugger {
 public:
     debugger(std::string prog_name, pid_t pid)
-        : m_prog_name{std::move(prog_name)}, m_pid{pid} {}
+        : m_prog_name{std::move(prog_name)}, m_pid{pid} {
+            auto fd = open(m_prog_name.c_str(), O_RDONLY);
+        
+        m_elf = elf::elf{elf::create_mmap_loader(fd)};
+        m_dwarf = dwarf::dwarf{dwarf::elf::create_loader(m_elf)};
+    }
 
     void run();
     void set_breakpoint_at_address(std::intptr_t addr);
@@ -32,4 +37,7 @@ private:
     std::string m_prog_name;
     pid_t m_pid;
     std::unordered_map<std::intptr_t,breakpoint> m_breakpoints;
+
+    elf::elf m_elf;
+    dwarf::dwarf m_dwarf;
 };
