@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cstdint>
+
+#include <sys/types.h>
+
 class breakpoint {
     public:
         breakpoint(pid_t pid, std::intptr_t addr):m_pid{pid}, m_addr{addr}, m_enabled{false}, m_saved_data{} {}

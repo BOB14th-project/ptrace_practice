@@ -1,5 +1,33 @@
 #include "pch.h"
 
+#include <stdexcept>
+
+#include "register.h"
+
+namespace {
+
+uint64_t parse_integer(const std::string& text) {
+    if (text.empty()) {
+        throw std::invalid_argument("missing numeric value");
+    }
+    std::size_t processed = 0;
+    const auto value = std::stoull(text, &processed, 0);
+    if (processed != text.size()) {
+        throw std::invalid_argument("invalid numeric value: " + text);
+    }
+    return value;
+}
+
+void report_error(const std::string& message) {
+    std::cerr << "[!] " << message << '\n';
+}
+
+void report_error(const std::exception& ex) {
+    report_error(ex.what());
+}
+
+} // namespace
+
 void debugger::run() {
     // Wait for the child to stop on its initial SIGTRAP after execve
     int wait_status = 0;
@@ -26,48 +54,116 @@ void debugger::run() {
     }
 }
 
-void debugger::handle_command(const std::string &line) {
+void debugger::handle_command(const std::string& line) {
     auto args = split(line, ' ');
     if (args.empty()) return;
-    const auto &command = args[0];
+    const auto& command = args[0];
 
     if (is_prefix(command, std::string("continue"))) {
         continue_execution();
-    } else if (command == "break" || command == "b") {
+        return;
+    }
+
+    if (command == "break" || command == "b") {
         if (args.size() < 2) {
-            std::cerr << "Usage: break <address>\n";
+            report_error("Usage: break <address>");
             return;
         }
-        std::intptr_t addr = std::stol(args[1], 0, 16);
-        set_breakpoint_at_address(addr);
-    } else if (command == "quit" || command == "q") {
-        std::cout << "bye\n";
-        // Let the loop in run() end by simulating EOF on stdin if needed.
-        // Here we simply send SIGKILL to the child and return; real dbg would detach.
-        kill(m_pid, SIGKILL);
-        // nothing else to do; user can Ctrl+D to exit the REPL
-    } else if (is_prefix(command, "register")){
-        if (is_prefix(args[1], "dump")) {
-            dump_registers();
-        } else if (is_prefix(args[1], "read")) {
-            std::cout << get_register_value(m_pid, get_register_from_name(args[2])) << std::endl;
-        } else if (is_prefix(args[1], "write")) {
-            std::string val {args[3], 2}; // assume 0xVAL
-            set_register_value(m_pid, get_register_from_name(args[2]), std::stol(val, 0, 16));
+        try {
+            auto addr = static_cast<std::intptr_t>(parse_integer(args[1]));
+            set_breakpoint_at_address(addr);
+        } catch (const std::exception& ex) {
+            report_error(ex);
         }
-    } else if (is_prefix(command, "memory")) {
-        std::string addr{args[2], 2}; // assume 0xADDR
-
-        if(is_prefix(args[1], "read")){
-            std::cout << std::hex << read_memory(std::stol(addr,0,16)) << std::endl; 
-        }
-        else if(is_prefix(args[1], "write")){
-            std::string val {args[3], 2}; // assume 0xVAL
-            write_memory(std::stol(addr,0,16), std::stol(val,0,16));
-        }
-    } else {
-        std::cerr << "Unknown command: " << command << "\n";
+        return;
     }
+
+    if (command == "quit" || command == "q") {
+        std::cout << "bye\n";
+        kill(m_pid, SIGKILL);
+        return;
+    }
+
+    if (is_prefix(command, "register")) {
+        if (args.size() < 2) {
+            report_error("Usage: register <dump|read|write> ...");
+            return;
+        }
+        const auto& subcommand = args[1];
+        if (is_prefix(subcommand, "dump")) {
+            dump_registers();
+            return;
+        }
+        if (is_prefix(subcommand, "read")) {
+            if (args.size() < 3) {
+                report_error("Usage: register read <name>");
+                return;
+            }
+            try {
+                auto value = get_register_value(m_pid, get_register_from_name(args[2]));
+                std::cout << args[2] << " = 0x" << std::hex << value << std::dec << '\n';
+            } catch (const std::exception& ex) {
+                report_error(ex);
+            }
+            return;
+        }
+        if (is_prefix(subcommand, "write")) {
+            if (args.size() < 4) {
+                report_error("Usage: register write <name> <value>");
+                return;
+            }
+            try {
+                const auto reg = get_register_from_name(args[2]);
+                const auto value = parse_integer(args[3]);
+                set_register_value(m_pid, reg, value);
+            } catch (const std::exception& ex) {
+                report_error(ex);
+            }
+            return;
+        }
+        report_error("Unknown register command: " + subcommand);
+        return;
+    }
+
+    if (is_prefix(command, "memory")) {
+        if (args.size() < 2) {
+            report_error("Usage: memory <read|write> ...");
+            return;
+        }
+        const auto& subcommand = args[1];
+        if (is_prefix(subcommand, "read")) {
+            if (args.size() < 3) {
+                report_error("Usage: memory read <address>");
+                return;
+            }
+            try {
+                const auto address = parse_integer(args[2]);
+                const auto value = read_memory(address);
+                std::cout << "0x" << std::hex << value << std::dec << '\n';
+            } catch (const std::exception& ex) {
+                report_error(ex);
+            }
+            return;
+        }
+        if (is_prefix(subcommand, "write")) {
+            if (args.size() < 4) {
+                report_error("Usage: memory write <address> <value>");
+                return;
+            }
+            try {
+                const auto address = parse_integer(args[2]);
+                const auto value = parse_integer(args[3]);
+                write_memory(address, value);
+            } catch (const std::exception& ex) {
+                report_error(ex);
+            }
+            return;
+        }
+        report_error("Unknown memory command: " + subcommand);
+        return;
+    }
+
+    std::cerr << "Unknown command: " << command << '\n';
 }
 
 std::vector<std::string> debugger::split(const std::string &s, char delimiter) {
@@ -88,25 +184,14 @@ bool debugger::is_prefix(const std::string &s, const std::string &of) {
 }
 
 void debugger::continue_execution() {
+    step_over_breakpoint();
+
     if (ptrace(PTRACE_CONT, m_pid, nullptr, nullptr) == -1) {
         perror("ptrace(PTRACE_CONT)");
         return;
     }
 
-    int wait_status = 0;
-    if (waitpid(m_pid, &wait_status, 0) < 0) {
-        perror("waitpid (continue)");
-        return;
-    }
-
-    if (WIFSTOPPED(wait_status)) {
-        int sig = WSTOPSIG(wait_status);
-        std::cout << "[stopped] signal " << sig << "\n";
-    } else if (WIFEXITED(wait_status)) {
-        std::cout << "[exit] status " << WEXITSTATUS(wait_status) << "\n";
-    } else if (WIFSIGNALED(wait_status)) {
-        std::cout << "[killed] by signal " << WTERMSIG(wait_status) << "\n";
-    }
+    wait_for_signal();
 }
 
 void debugger::set_breakpoint_at_address(std::intptr_t addr){
@@ -116,56 +201,81 @@ void debugger::set_breakpoint_at_address(std::intptr_t addr){
     m_breakpoints.insert_or_assign(addr, std::move(bp));
 }
 
-void debugger::dump_registers(){
-    for(const auto& rd : g_register_descriptors){
-        uint64_t value = get_register_value(m_pid, rd.r);
-        std::cout << rd.name << " 0x" << std::hex << value << std::dec << '\n';
+void debugger::dump_registers() {
+    std::ios_base::fmtflags original_flags{std::cout.flags()};
+    for (const auto& rd : g_register_descriptors) {
+        try {
+            const auto value = get_register_value(m_pid, rd.r);
+            std::cout << rd.name << " 0x" << std::hex << value << std::dec << '\n';
+        } catch (const std::exception& ex) {
+            report_error(std::string("failed to read register ") + rd.name + ": " + ex.what());
+        }
+    }
+    std::cout.flags(original_flags);
+}
+
+uint64_t debugger::read_memory(uint64_t address) {
+    errno = 0;
+    const auto data = ptrace(PTRACE_PEEKDATA, m_pid, reinterpret_cast<void*>(address), nullptr);
+    if (data == -1 && errno) {
+        throw std::runtime_error(std::string("ptrace(PTRACE_PEEKDATA) failed: ") + std::strerror(errno));
+    }
+    return static_cast<uint64_t>(data);
+}
+
+void debugger::write_memory(uint64_t address, uint64_t value) {
+    errno = 0;
+    if (ptrace(PTRACE_POKEDATA, m_pid, reinterpret_cast<void*>(address), reinterpret_cast<void*>(value)) == -1) {
+        throw std::runtime_error(std::string("ptrace(PTRACE_POKEDATA) failed: ") + std::strerror(errno));
     }
 }
 
-uint64_t debugger::read_memory(uint64_t address){
-    return ptrace(PTRACE_PEEKDATA, m_pid, address, nullptr);
-}
-
-void debugger::write_memory(uint64_t address, uint64_t value){
-    ptrace(PTRACE_POKEDATA, m_pid, address, value);
-}
-
-uint64_t debugger::get_pc(){
+uint64_t debugger::get_pc() const {
     return get_register_value(m_pid, reg::rip);
 }
 
-void debugger::set_pc(uint64_t pc){
+void debugger::set_pc(uint64_t pc) {
     set_register_value(m_pid, reg::rip, pc);
 }
 
-void debugger::step_over_breakpoint(){
-    // -1 because execution will go past the breakpoint
-    auto possible_breakpoint_location = get_pc() - 1;
+void debugger::step_over_breakpoint() {
+    const auto possible_breakpoint_location = static_cast<std::intptr_t>(get_pc() - 1);
 
-    if(m_breakpoints.count(possible_breakpoint_location)){
-        auto& bp = m_breakpoints[possible_breakpoint_location];
+    const auto it = m_breakpoints.find(possible_breakpoint_location);
+    if (it == m_breakpoints.end()) return;
 
-        if (bp.is_enabled()){
-            auto previous_instruction_address = possible_breakpoint_location;
-            set_pc(previous_instruction_address);
+    auto& bp = it->second;
+    if (!bp.is_enabled()) return;
 
-            bp.disable();
-            ptrace(PTRACE_SINGLESTEP, m_pid, nullptr, nullptr);
-            wait_for_signal();
-            bp.enable();
+    const auto previous_instruction_address = static_cast<uint64_t>(possible_breakpoint_location);
+    set_pc(previous_instruction_address);
+
+    bp.disable();
+    if (ptrace(PTRACE_SINGLESTEP, m_pid, nullptr, nullptr) == -1) {
+        perror("ptrace(PTRACE_SINGLESTEP)");
+    } else {
+        wait_for_signal(false);
+    }
+    bp.enable();
+}
+
+int debugger::wait_for_signal(bool report) {
+    int wait_status = 0;
+    if (waitpid(m_pid, &wait_status, 0) < 0) {
+        perror("waitpid");
+        return -1;
+    }
+
+    if (report) {
+        if (WIFSTOPPED(wait_status)) {
+            const auto sig = WSTOPSIG(wait_status);
+            std::cout << "[stopped] signal " << sig << '\n';
+        } else if (WIFEXITED(wait_status)) {
+            std::cout << "[exit] status " << WEXITSTATUS(wait_status) << '\n';
+        } else if (WIFSIGNALED(wait_status)) {
+            std::cout << "[killed] by signal " << WTERMSIG(wait_status) << '\n';
         }
     }
-}
 
-void debugger::wait_for_signal(){
-    int wait_status;
-    auto options = 0;
-    waitpid(m_pid, &wait_status, options);
-}
-
-void debugger::continue_execution(){
-    step_over_breakpoint();
-    ptrace(PTRACE_CONT, m_pid, nullptr, nullptr);
-    wait_for_signal();
+    return wait_status;
 }

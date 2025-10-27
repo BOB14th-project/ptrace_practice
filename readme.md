@@ -82,6 +82,25 @@ end
 
 임의 프로그램을 직접 실행할 때는 setarch -R 또는 personality(ADDR_NO_RANDOMIZE)로 ASLR을 끄거나, 위 ASLR 켠 상태의 절차처럼 `/proc/<pid>/maps` 기반으로 주소를 계산하는 것 중 필요한 쪽을 골라 쓰면 된다.......
 
+## 03. register_and_memory
+
+```bash
+➜  03.register_and_memory git:(master) ✗ ./minidbg ./target
+minidbg> break 0x555555555169
+Set breakpoint at address 0x555555555169
+minidbg> cont
+[stopped] signal 5
+minidbg> cont
+start
+middle
+end
+[exit] status 0
+minidbg>
+```
+02번 디버거와 기본 흐름은 같지만, `register dump/read/write`와 `memory read/write` 명령으로 레지스터·메모리를 직접 다루고, 브레이크포인트 복구를 위해 `PTRACE_SINGLESTEP`과 `rip` 재설정을 수행하며, ptrace 에러를 예외로 보고하고 모든 신호를 로그로 확인할 수 있도록 동작을 확장
+
+
+
 
 ## 고려해야할 방해 로직들...
 
