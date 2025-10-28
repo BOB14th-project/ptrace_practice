@@ -17,6 +17,33 @@
 
 #include "breakpoint.h"
 
+enum class symbol_type {
+    notype,
+    object,
+    func,
+    section,
+    file,
+};
+
+inline std::string to_string(symbol_type st) {
+    switch (st) {
+    case symbol_type::notype: return "notype";
+    case symbol_type::object: return "object";
+    case symbol_type::func: return "func";
+    case symbol_type::section: return "section";
+    case symbol_type::file: return "file";
+    }
+    throw std::runtime_error("unknown symbol_type");
+}
+
+struct symbol {
+    symbol_type type;
+    std::string name;
+    std::uintptr_t addr;
+};
+
+symbol_type to_symbol_type(elf::stt sym);
+
 class debugger {
 public:
     debugger(std::string prog_name, pid_t pid)
@@ -39,6 +66,9 @@ private:
     void handle_command(const std::string &line);
     void continue_execution();
     void dump_registers();
+    void set_breakpoint_at_function(const std::string& name);
+    void set_breakpoint_at_source_line(const std::string& file, unsigned line);
+    std::vector<symbol> lookup_symbol(const std::string& name);
     uint64_t read_memory(uint64_t address);
     void write_memory(uint64_t address, uint64_t value);
     uint64_t get_pc() const;

@@ -420,6 +420,14 @@ BP 해제 → `PTRACE_SINGLESTEP` → 재대기 → BP 재설치 순서로 진�
 - DWARF 함수 범위를 얻기 위해 `low_pc`/`high_pc` 속성을 읽어 런타임 주소로 변환한다. high_pc가 상대 오프셋인 케이스도 지원하도록 변환 로직을 보강했다.
 - `step`/`next` 명령은 각 단계에서 `get_line_entry_from_pc(get_offset_pc())`가 실패할 수 있으므로, 에러 메시지를 남기고 가능한 한 현재 실행을 이어가도록 했다.
 
+## 07. source level breakpoints
+
+- `break foo.cpp:42`처럼 파일:라인 형식으로 브레이크포인트를 걸면 DWARF 라인 테이블을 찾아 `offset_dwarf_address()`로 런타임 주소를 계산한 뒤 설치한다.
+- `break 함수이름`은 해당 이름을 가진 `DW_TAG_subprogram`의 `low_pc` → prologue 건너뛴 첫 라인을 찾아 그 지점에 브레이크포인트를 심는다.
+- `break 0xADDR`도 그대로 유지되지만, PIE 바이너리에서도 자동으로 로드 베이스를 빼주는 덕분에 동일한 커맨드로 사용 가능하다.
+- `symbol <name>` 명령을 추가해 `.symtab`/`.dynsym`를 순회하며 일치하는 심볼 정보를 나열한다. 새로 도입한 `lookup_symbol()`이 `symbol_type`·`to_symbol_type()` 헬퍼와 함께 이 기능을 담당한다.
+- 헤더에는 함수/라인 브레이크포인트와 심볼 조회용 멤버 선언을 추가해 구현부와 인터페이스가 맞춰졌다.
+
 ## 고려해야할 방해 로직들...
 
 - ptrace 감지/배제: ptrace(PTRACE_TRACEME) 재호출, getppid() 체크, /proc/self/status의 TracerPid 확인 등으로 디버거 존재를 감지해 종료하거나 기능을 바꿉니다.
