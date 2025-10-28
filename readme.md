@@ -142,7 +142,11 @@ ELF + DWARF 정보로 파일:라인에서 실제 코드 주소를 찾아서 소�
 
 ## 05. Source and Signals
 
-### 추가한 함수 설명
+### run()과 초기화 흐름
+- `debugger` 생성자는 실행 파일을 `open(O_RDONLY)`으로 연 뒤 libelfin 로더를 사용해 `m_elf`, `m_dwarf`를 초기화하고, FD는 즉시 닫는다. 이후 모든 DWARF 조회가 이 핸들을 재사용한다.
+- `run()`은 최초 `wait_for_signal(false)`로 exec 직후 SIGTRAP을 받아들이고, 조기 종료/시그널을 체크한 다음 `initialize_load_address()`로 PIE 오프셋을 준비한다. 이어서 `PTRACE_SETOPTIONS`(EXITKILL, TRACESYSGOOD)를 걸고 REPL을 시작한다.
+
+### 세부 함수 메모
 
 ```cpp
 void debugger::initialize_load_address() {
@@ -170,9 +174,7 @@ void debugger::initialize_load_address() {
     }
 }
 ```
-대상 프로세스의 로드 베이스 주소를 계산한다. attach/exec 직후 한번 호출됨
-/proc/<pid>/maps을 읽어서 실행 파일 매핑 라인을 찾아 시작 주소를 저장
-정적(PHDR 고정 바이너리는 0으로 둘 수 있다) - ????????
+대상 프로세스의 로드 베이스 주소를 계산한다. `run()` 입구에서 한 번 호출되며, ELF 타입이 `ET_DYN`이 아닐 경우 그대로 0을 유지한다. `/proc/<pid>/maps` 첫 매핑의 시작 주소를 파싱해 `m_load_address`에 저장하고, 읽기/파싱 실패는 `report_error`로 기록한다.
 
 ```cpp
 uint64_t debugger::offset_load_address(uint64_t addr) const {
@@ -182,8 +184,7 @@ uint64_t debugger::offset_load_address(uint64_t addr) const {
     return addr - m_load_address;
 }
 ```
-디버거 내부에서 사용할 오프셋 고정 주소 반환
-PIE가 아닌 경우 m_load_address = 0 이라서 아래쪽의 반환 로직만 으로도 안전하다
+PIE 바이너리와 공유 라이브러리에서만 로드 베이스를 빼고, 그렇지 않은 경우(비-PIE, 이미 보정된 주소)는 그대로 돌려준다. `addr < m_load_address` 같은 비정상 상황도 그냥 원본 주소를 반환하도록 방어 로직을 둔 상태.
 
 ```cpp
 dwarf::die debugger::get_function_from_pc(uint64_t pc) {
@@ -201,9 +202,7 @@ dwarf::die debugger::get_function_from_pc(uint64_t pc) {
     throw std::out_of_range{"Cannot find function"};
 }
 ```
-특정 PC가 속한 함수(DW_TAG::subprogram) DIE 찾기
-브레이크, 스텝 정지시 현재 함수명 출력, 스코프 판정에 사용된다
-인라인함수나 LTO는 추가 처리가 필요하다고함
+특정 PC가 속한 함수(`DW_TAG::subprogram`) DIE를 찾는다. 현재는 선형 탐색이라 단순하지만 브레이크/스텝 정지 시 함수명 확인, 향후 스코프 분석 등에 바로 활용 가능하다. 인라인 함수나 LTO 결과까지 엄밀히 처리하려면 추가 로직이 필요하다.
 
 ```cpp
 dwarf::line_table::iterator debugger::get_line_entry_from_pc(uint64_t pc) {
@@ -220,9 +219,7 @@ dwarf::line_table::iterator debugger::get_line_entry_from_pc(uint64_t pc) {
     throw std::out_of_range{"Cannot find line entry"};
 }
 ```
-PC에 대응하는 라인 테이블 엔트리 반환(파일경로, 라인 번호 포함)
-정지 시 소스 콘텍스트 표시, 현재 라인 강조에 쓴다
-최적화나 컴파일 옵션에 따라 완벽한 맵핑이 안될 수 있다.(근접 엔트리 사용 - 무슨 말이지 이게..?)
+PC에 대응하는 라인 테이블 엔트리를 반환한다(파일 경로, 라인 번호 포함). 정지 시 소스 콘텍스트를 뽑는 기본 자료로 쓰이며, 주소가 정확히 매칭되지 않으면 `std::out_of_range`를 던져 호출자에게 처리를 맡긴다. 최적화 수준이 높을수록 테이블 자체가 비어 있을 수 있다는 점만 주의하면 된다.
 
 ```cpp
 void debugger::print_source(const std::string& file_name, unsigned line, unsigned n_lines_context){
@@ -264,9 +261,7 @@ void debugger::print_source(const std::string& file_name, unsigned line, unsigne
     std::cout << std::endl;
 }
 ```
-지정된 파일의 라인 주변 context 출력, 현재 라인에 강조표시
-브레이크, 스텝 정지 직후 호출된다
-IO비용으로 인해 토글하거나 로그 남기는 형태로 바꾸는 옵션 필요할수도
+지정된 파일의 주변 라인을 출력하며 현재 라인을 `>`로 강조한다. 파일 열기에 실패하면 바로 에러를 신고하고 조용히 리턴한다. 브레이크포인트나 단일 스텝에서 멈춘 직후 호출된다.
 
 ```cpp
 siginfo_t debugger::get_signal_info() {
@@ -278,8 +273,7 @@ siginfo_t debugger::get_signal_info() {
     return info;
 }
 ```
-마지막 이벤트의 시그널 정보 획득 함수, waitpid로 멈춘 직후에 호출된다
-ptrace(PTRACE_GETSIGINFO) 실패처리 - ????????????
+`waitpid`로 STOP 상태를 확인한 직후 호출해 마지막 신호의 `siginfo_t`를 얻는다. `PTRACE_GETSIGINFO`가 실패하면 errno 로그를 남기고 0으로 초기화된 구조체를 반환해 이후 로직이 무너지는 것을 방지한다.
 
 ```cpp
 void debugger::handle_sigtrap(siginfo_t info) {
@@ -314,8 +308,8 @@ SIGTRAP 원인 분기 처리하는 함수
 
 1. get_pc()로 현재 RIP/PC 읽고
 2. 소프트웨어 BP(int3 = 0xcc) 있으므로 PC-1을 보정한다
-3. 보정된 PC 기준으로 BP를 해제하고 > 단일 스텝 > BP 재설치(필요시)
-4. get_line_entry_from_pc() > print_source()로 소스 표시한다
+3. 보정된 PC를 로드 오프셋으로 조정한 뒤 `get_line_entry_from_pc()` → `print_source()`를 통해 현재 소스 문맥을 출력한다
+4. 단일 스텝 복구는 `continue`/`next` 등의 명령에서 `step_over_breakpoint()`가 담당한다
 
 x86외 아키텍쳐 BP는 별도 처리가 필요하다
 
@@ -374,8 +368,7 @@ waitpid 루프의 중앙 허브, 정지 원인에 따라서 분기한다
 3. info.si_signo에 따라서
     - SIGTRAP > handle_sigtrap(info)
     - SIGSEGV > si_code/주소 로그(옵션으로 메모리 덤프)
-    - 기타 > 로깅
-??????????
+    - 기타 > `strsignal`로 간단히 알림
 
 ```cpp
 void debugger::step_over_breakpoint() {
@@ -399,29 +392,14 @@ void debugger::step_over_breakpoint() {
 }
 ```
 히트한 BP를 한번 우회하는 표준 루틴
-BP해제 > PTRACE_SINGLESTEP > 대기 > BP 재설치
-TRAP_BRKPT 처리 중, PC 보정 직후 호출된다
-
-### DWARF/ELF 파싱과 주소 변환
-- 디버거 생성자에서 실행 파일을 `open`한 뒤 libelfin으로 ELF/DWARF 핸들을 만들어 `m_elf`, `m_dwarf`에 저장. 이후 모든 소스/라인 조회에 reuse.
-- `get_function_from_pc(uint64_t pc)`: 현재 PC가 속한 컴파일 유닛(CU)을 찾고, 그 안의 `DW_TAG_subprogram` DIE를 순회해서 해당 함수를 반환. 인라인/멤버 함수 처리도 확장 여지 있음.
-- `get_line_entry_from_pc(uint64_t pc)`: 위와 동일하게 CU를 찾은 뒤 라인 테이블에서 주소에 대응하는 엔트리를 돌려줌. 파일 경로/라인 번호를 얻는 기본 API.
-- `initialize_load_address()`와 `offset_load_address(uint64_t addr)`: PIE/공유 라이브러리라면 `/proc/<pid>/maps`의 첫 매핑 주소를 로드 베이스로 기록하고, 질의할 때 `addr - m_load_address`로 오프셋을 보정.
-
-### 소스 출력
-- `print_source(const std::string&, unsigned, unsigned ctx=2)`: 소스 파일을 열어 현재 라인 주변을 출력하고, 현재 라인 앞에는 `>` 커서를 붙인다. 브레이크포인트·단일 스텝 정지 시 사용.
-
-### 시그널 처리 고도화
-- `get_signal_info()`: `ptrace(PTRACE_GETSIGINFO)`로 직전 신호의 `siginfo_t`를 확보.
-- `wait_for_signal(bool report)`: `waitpid`로 대기 후 `get_signal_info()`를 호출하고, `SIGTRAP`이면 `handle_sigtrap`으로 분기, `SIGSEGV`면 `si_code`/`si_addr`를 출력, 나머지는 `strsignal`로 로깅.
-- `handle_sigtrap(siginfo_t)`: `SI_KERNEL`/`TRAP_BRKPT`에서 PC를 1바이트 되돌리고, 로드 오프셋을 적용한 뒤 `get_line_entry_from_pc` → `print_source`로 현재 소스 컨텍스트를 맞춰 준다. `TRAP_TRACE`는 단일 스텝 완료 케이스.
-- `step_over_breakpoint()`: SIGTRAP 처리에서 PC를 되돌려주므로, 여기서는 브레이크포인트만 잠시 비활성화 → `PTRACE_SINGLESTEP` → 다시 설치하는 역할만 담당.
+BP 해제 → `PTRACE_SINGLESTEP` → 재대기 → BP 재설치 순서로 진행한다.
+`continue`나 다른 실행 명령이 재개되기 전에 호출돼, 방금 히트한 소프트웨어 브레이크포인트를 원래 명령으로 되돌린다.
 
 ### 실행 흐름 예시 - SW breakpoint hit
 1. target int3 도달 > SIGTRAP/TRAP_BPKPT 정지
 2. wait_for_signal() > get_signal_info() > handle_sigtrap()
 3. get_pc > set_pc(pc-1) (0xcc 보정)
-4. step_over_breakpoint() 로 원본 바이트를 복구하고 한 스텝 이후 재설치
+4. 사용자가 `continue` 등을 호출하면 step_over_breakpoint()가 원본 바이트를 복구하고 단일 스텝 후 재설치
 5. get_line_entry_from_pc() > print_source() 로 현재 소스 표시
 6. 사용자 입력 루프 (계속/다음 스텝/다른 BP 설정 등...)
 
