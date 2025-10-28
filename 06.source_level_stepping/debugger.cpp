@@ -27,6 +27,44 @@ void report_error(const std::exception& ex) {
     report_error(ex.what());
 }
 
+uint64_t die_attribute_as_address(const dwarf::die& die, dwarf::DW_AT attr) {
+    const auto value = die[attr];
+    if (!value) {
+        throw std::out_of_range{"missing DWARF attribute"};
+    }
+
+    using dwarf::value;
+    switch (value.get_type()) {
+    case value::type::address:
+        return value.as_address();
+    case value::type::constant:
+        return value.as_uconstant();
+    default:
+        throw std::runtime_error{"unsupported DWARF attribute encoding"};
+    }
+}
+
+uint64_t at_low_pc(const dwarf::die& die) {
+    return die_attribute_as_address(die, dwarf::DW_AT::low_pc);
+}
+
+uint64_t at_high_pc(const dwarf::die& die) {
+    const auto attr = die[dwarf::DW_AT::high_pc];
+    if (!attr) {
+        throw std::out_of_range{"missing high_pc attribute"};
+    }
+
+    using dwarf::value;
+    switch (attr.get_type()) {
+    case value::type::address:
+        return attr.as_address();
+    case value::type::constant:
+        return at_low_pc(die) + attr.as_uconstant();
+    default:
+        throw std::runtime_error{"unsupported high_pc encoding"};
+    }
+}
+
 } // namespace
 
 void debugger::run() {
@@ -169,8 +207,12 @@ void debugger::handle_command(const std::string& line) {
 
     if (is_prefix(command, "stepi")){
         single_step_instruction_with_breakpoint_check();
-        auto line_entry = get_line_entry_from_pc(get_pc());
-        print_source(line_entry->file->path, line_entry->line, 2);
+        try {
+            auto line_entry = get_line_entry_from_pc(get_offset_pc());
+            print_source(line_entry->file->path, line_entry->line, 2);
+        } catch (const std::exception& ex) {
+            report_error(std::string("failed to locate source after stepi: ") + ex.what());
+        }
         return;
     }
 
@@ -260,6 +302,10 @@ uint64_t debugger::get_pc() const {
 
 void debugger::set_pc(uint64_t pc) {
     set_register_value(m_pid, reg::rip, pc);
+}
+
+uint64_t debugger::get_offset_pc() const {
+    return offset_load_address(get_pc());
 }
 
 int debugger::wait_for_signal(bool report) {
@@ -468,7 +514,10 @@ void debugger::step_over_breakpoint() {
 }
 
 void debugger::single_step_instruction(){
-    ptrace(PTRACE_SINGLESTEP, m_pid, nullptr, nullptr);
+    if (ptrace(PTRACE_SINGLESTEP, m_pid, nullptr, nullptr) == -1) {
+        perror("ptrace(PTRACE_SINGLESTEP)");
+        return;
+    }
     wait_for_signal();
 }
 
@@ -499,44 +548,87 @@ void debugger::step_out(){
 }
 
 void debugger::remove_breakpoint(std::intptr_t addr){
-    if(m_breakpoints.at(addr).is_enabled()){
-        m_breakpoints.at(addr).disable();
+    const auto it = m_breakpoints.find(addr);
+    if (it == m_breakpoints.end()) {
+        return;
     }
-    m_breakpoints.erase(addr);
+    if (it->second.is_enabled()) {
+        it->second.disable();
+    }
+    m_breakpoints.erase(it);
 }
 
 void debugger::step_in(){
-    auto line = get_line_entry_from_pc(get_pc())->line;
-
-    while(get_line_entry_from_pc(get_offset_pc())->line == line){
+    unsigned current_line = 0;
+    try {
+        current_line = get_line_entry_from_pc(get_offset_pc())->line;
+    } catch (const std::exception& ex) {
+        report_error(std::string("step: cannot resolve current line: ") + ex.what());
         single_step_instruction_with_breakpoint_check();
+        return;
     }
 
-    auto line_entry = get_line_entry_from_pc(get_offset_pc());
-    print_source(line_entry->file->path, line_entry->line, 2);
+    try {
+        while (get_line_entry_from_pc(get_offset_pc())->line == current_line) {
+            single_step_instruction_with_breakpoint_check();
+        }
+    } catch (const std::exception&) {
+        // Reached code without line info; fall through and try to display whatever we can.
+    }
+
+    try {
+        auto line_entry = get_line_entry_from_pc(get_offset_pc());
+        print_source(line_entry->file->path, line_entry->line, 2);
+    } catch (const std::exception& ex) {
+        report_error(std::string("step: cannot display source: ") + ex.what());
+    }
 }
 
-uint64_t debugger::offset_dwarf_address(uint64_t addr) {
+uint64_t debugger::offset_dwarf_address(uint64_t addr) const {
     return addr + m_load_address;
 }
 
 void debugger::step_over(){
-    auto func = get_function_from_pc(get_offset_pc());
-    auto func_entry = at_low_pc(func);
-    auto func_end = at_high_pc(func);
+    dwarf::die func;
+    const auto offset_pc = get_offset_pc();
 
-    auto line = get_line_entry_from_pc(func_entry);
-    auto start_line = get_line_entry_from_pc(get_offset_pc());
+    try {
+        func = get_function_from_pc(offset_pc);
+    } catch (const std::exception& ex) {
+        report_error(std::string("next: cannot identify current function: ") + ex.what());
+        single_step_instruction_with_breakpoint_check();
+        return;
+    }
+
+    const auto func_entry = at_low_pc(func);
+    const auto func_end = at_high_pc(func);
+
+    uint64_t start_address = 0;
+    try {
+        start_address = get_line_entry_from_pc(offset_pc)->address;
+    } catch (const std::exception& ex) {
+        report_error(std::string("next: cannot resolve current line: ") + ex.what());
+    }
 
     std::vector<std::intptr_t> to_delete{};
 
-    while(line->address < func_end){
-        auto load_address = offset_dwarf_address(line->address);
-        if(line->address != start_line->address && !m_breakpoints.count(load_address)){
-            set_breakpoint_at_address(load_address);
-            to_delete.push_back(load_address);
+    for (auto& cu : m_dwarf.compilation_units()) {
+        if (!die_pc_range(cu.root()).contains(func_entry)) {
+            continue;
         }
-        ++line;
+
+        auto& lt = cu.get_line_table();
+        for (auto it = lt.begin(); it != lt.end(); ++it) {
+            if (it->end_sequence) continue;
+            if (it->address < func_entry || it->address >= func_end) continue;
+
+            const auto load_address = offset_dwarf_address(it->address);
+            if (it->address != start_address && !m_breakpoints.count(load_address)) {
+                set_breakpoint_at_address(load_address);
+                to_delete.push_back(load_address);
+            }
+        }
+        break;
     }
 
     auto frame_pointer = get_register_value(m_pid, reg::rbp);

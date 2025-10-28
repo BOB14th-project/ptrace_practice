@@ -403,7 +403,22 @@ BP 해제 → `PTRACE_SINGLESTEP` → 재대기 → BP 재설치 순서로 진�
 5. get_line_entry_from_pc() > print_source() 로 현재 소스 표시
 6. 사용자 입력 루프 (계속/다음 스텝/다른 BP 설정 등...)
 
-## 06. 
+## 06. source level stepping
+
+### 단일 스텝 헬퍼
+- `get_offset_pc()`는 현재 RIP에서 로드 베이스를 빼 DWARF 오프셋을 돌려준다. 반대로 `offset_dwarf_address(uint64_t)`는 DWARF 주소에 로드 베이스를 더해 런타임 주소를 만든다.
+- `single_step_instruction()`은 `PTRACE_SINGLESTEP` 호출과 `wait_for_signal()`을 감싼 가장 작은 스텝 단위이고, 오류 발생 시 바로 리포트한다.
+- `single_step_instruction_with_breakpoint_check()`는 현재 PC 지점에 소프트웨어 BP가 있으면 `step_over_breakpoint()`로 우회 후 계속, 아니면 위 단일 스텝을 호출한다. `stepi` 명령은 이 함수를 호출한 뒤 `get_line_entry_from_pc(get_offset_pc())` 결과를 출력해준다.
+
+### 고수준 소스라인 스텝 명령
+- `step_in()` (`step`): 현재 라인 번호를 기억했다가, 다른 라인이 나올 때까지 `single_step_instruction_with_breakpoint_check()`를 반복한다. 라인 정보를 찾지 못하면 에러를 로그로 남기고 단일 스텝만 수행한다.
+- `step_over()` (`next`): 현재 PC가 속한 함수의 `low_pc`/`high_pc` 구간을 조사한 뒤, 같은 함수 안의 다른 소스 라인들과 함수 리턴 주소에 임시 BP를 건다. `continue_execution()`으로 진행 후, 히트된 임시 BP를 모두 해제한다. 라인 테이블이 없거나 함수 탐색이 실패하면 경고 후 단일 스텝으로 대체한다.
+- `step_out()` (`finish`): 현재 프레임의 `rbp+8` 위치에 있는 리턴 주소에 BP를 세팅해 `continue_execution()` 하고, 복귀 시 임시 BP를 제거한다.
+- `remove_breakpoint()`는 해당 주소에 BP가 실제 존재할 때만 disable → erase를 수행해 예외 없이 정리한다.
+
+### 기타 메모
+- DWARF 함수 범위를 얻기 위해 `low_pc`/`high_pc` 속성을 읽어 런타임 주소로 변환한다. high_pc가 상대 오프셋인 케이스도 지원하도록 변환 로직을 보강했다.
+- `step`/`next` 명령은 각 단계에서 `get_line_entry_from_pc(get_offset_pc())`가 실패할 수 있으므로, 에러 메시지를 남기고 가능한 한 현재 실행을 이어가도록 했다.
 
 ## 고려해야할 방해 로직들...
 
