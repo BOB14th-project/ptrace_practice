@@ -403,7 +403,7 @@ BP 해제 → `PTRACE_SINGLESTEP` → 재대기 → BP 재설치 순서로 진�
 5. get_line_entry_from_pc() > print_source() 로 현재 소스 표시
 6. 사용자 입력 루프 (계속/다음 스텝/다른 BP 설정 등...)
 
-
+## 06. 
 
 ## 고려해야할 방해 로직들...
 
