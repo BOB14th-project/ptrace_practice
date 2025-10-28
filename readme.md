@@ -140,7 +140,292 @@ ELF + DWARF 정보로 파일:라인에서 실제 코드 주소를 찾아서 소�
 
 하면서 내용 수정...
 
-## 05. 
+## 05. Source and Signals
+
+### 추가한 함수 설명
+
+```cpp
+void debugger::initialize_load_address() {
+    m_load_address = 0;
+
+    if (m_elf.get_hdr().type != elf::et::dyn) {
+        return;
+    }
+
+    std::ifstream map("/proc/" + std::to_string(m_pid) + "/maps");
+    if (!map) {
+        report_error("failed to open /proc/" + std::to_string(m_pid) + "/maps");
+        return;
+    }
+
+    std::string addr;
+    if (std::getline(map, addr, '-')) {
+        try {
+            m_load_address = std::stoull(addr, nullptr, 16);
+        } catch (const std::exception& ex) {
+            report_error(std::string("failed to parse load address: ") + ex.what());
+        }
+    } else {
+        report_error("unexpected format while reading load address");
+    }
+}
+```
+대상 프로세스의 로드 베이스 주소를 계산한다. attach/exec 직후 한번 호출됨
+/proc/<pid>/maps을 읽어서 실행 파일 매핑 라인을 찾아 시작 주소를 저장
+정적(PHDR 고정 바이너리는 0으로 둘 수 있다) - ????????
+
+```cpp
+uint64_t debugger::offset_load_address(uint64_t addr) const {
+    if (m_load_address == 0 || addr < m_load_address) {
+        return addr;
+    }
+    return addr - m_load_address;
+}
+```
+디버거 내부에서 사용할 오프셋 고정 주소 반환
+PIE가 아닌 경우 m_load_address = 0 이라서 아래쪽의 반환 로직만 으로도 안전하다
+
+```cpp
+dwarf::die debugger::get_function_from_pc(uint64_t pc) {
+    for (auto &cu : m_dwarf.compilation_units()) {
+        if (die_pc_range(cu.root()).contains(pc)) {
+            for (const auto& die : cu.root()) {
+                if (die.tag == dwarf::DW_TAG::subprogram) {
+                    if (die_pc_range(die).contains(pc)) {
+                        return die;
+                    }
+                }
+            }
+        }
+    }
+    throw std::out_of_range{"Cannot find function"};
+}
+```
+특정 PC가 속한 함수(DW_TAG::subprogram) DIE 찾기
+브레이크, 스텝 정지시 현재 함수명 출력, 스코프 판정에 사용된다
+인라인함수나 LTO는 추가 처리가 필요하다고함
+
+```cpp
+dwarf::line_table::iterator debugger::get_line_entry_from_pc(uint64_t pc) {
+    for (auto &cu : m_dwarf.compilation_units()) {
+        if (die_pc_range(cu.root()).contains(pc)) {
+            auto& lt = cu.get_line_table();
+            auto it = lt.find_address(pc);
+            if (it == lt.end()) {
+                throw std::out_of_range{"Cannot find line entry"};
+            }
+            return it;
+        }
+    }
+    throw std::out_of_range{"Cannot find line entry"};
+}
+```
+PC에 대응하는 라인 테이블 엔트리 반환(파일경로, 라인 번호 포함)
+정지 시 소스 콘텍스트 표시, 현재 라인 강조에 쓴다
+최적화나 컴파일 옵션에 따라 완벽한 맵핑이 안될 수 있다.(근접 엔트리 사용 - 무슨 말이지 이게..?)
+
+```cpp
+void debugger::print_source(const std::string& file_name, unsigned line, unsigned n_lines_context){
+    std::ifstream file{file_name};
+    if (!file) {
+        report_error("failed to open source file: " + file_name);
+        return;
+    }
+
+    // Work out a window around the desired line
+    auto start_line = line <= n_lines_context ? 1 : line - n_lines_context;
+    auto end_line = line + n_lines_context + (line < n_lines_context ? n_lines_context - line : 0) + 1;
+
+    char c{};
+    auto current_line = 1u;
+    // Skip lines up until start_line
+    while (current_line != start_line && file.get(c)) {
+        if (c == '\n') {
+            ++current_line;
+        }
+    }
+
+    if (current_line > end_line) {
+        return;
+    }
+
+    std::cout << (current_line == line ? "> " : "  ");
+
+    // Write lines up until end_line
+    while (current_line <= end_line && file.get(c)) {
+        std::cout << c;
+        if (c == '\n') {
+            ++current_line;
+            // Output cursor if we are at the current line
+            std::cout << (current_line == line ? "> " : "  ");
+        }
+    }
+
+    std::cout << std::endl;
+}
+```
+지정된 파일의 라인 주변 context 출력, 현재 라인에 강조표시
+브레이크, 스텝 정지 직후 호출된다
+IO비용으로 인해 토글하거나 로그 남기는 형태로 바꾸는 옵션 필요할수도
+
+```cpp
+siginfo_t debugger::get_signal_info() {
+    siginfo_t info{};
+    if (ptrace(PTRACE_GETSIGINFO, m_pid, nullptr, &info) == -1) {
+        perror("ptrace(PTRACE_GETSIGINFO)");
+        std::memset(&info, 0, sizeof(info));
+    }
+    return info;
+}
+```
+마지막 이벤트의 시그널 정보 획득 함수, waitpid로 멈춘 직후에 호출된다
+ptrace(PTRACE_GETSIGINFO) 실패처리 - ????????????
+
+```cpp
+void debugger::handle_sigtrap(siginfo_t info) {
+    switch (info.si_code) {
+    //one of these will be set if a breakpoint was hit
+    case SI_KERNEL:
+    case TRAP_BRKPT:
+    {
+        const auto pc = get_pc() - 1;
+        set_pc(pc); // put the pc back where it should be
+        std::cout << "Hit breakpoint at address 0x" << std::hex << pc << std::dec << '\n';
+
+        const auto offset_pc = offset_load_address(pc);
+        try {
+            auto line_entry = get_line_entry_from_pc(offset_pc);
+            print_source(line_entry->file->path, line_entry->line, 2);
+        } catch (const std::exception& ex) {
+            report_error(std::string("failed to print source: ") + ex.what());
+        }
+        return;
+    }
+    //this will be set if the signal was sent by single stepping
+    case TRAP_TRACE:
+        return;
+    default:
+        std::cout << "Unknown SIGTRAP code " << info.si_code << std::endl;
+        return;
+    }
+}
+```
+SIGTRAP 원인 분기 처리하는 함수
+
+1. get_pc()로 현재 RIP/PC 읽고
+2. 소프트웨어 BP(int3 = 0xcc) 있으므로 PC-1을 보정한다
+3. 보정된 PC 기준으로 BP를 해제하고 > 단일 스텝 > BP 재설치(필요시)
+4. get_line_entry_from_pc() > print_source()로 소스 표시한다
+
+x86외 아키텍쳐 BP는 별도 처리가 필요하다
+
+```cpp
+int debugger::wait_for_signal(bool report) {
+    int wait_status = 0;
+    if (waitpid(m_pid, &wait_status, 0) < 0) {
+        perror("waitpid");
+        return -1;
+    }
+
+    if (WIFEXITED(wait_status)) {
+        if (report) {
+            std::cout << "[exit] status " << WEXITSTATUS(wait_status) << '\n';
+        }
+        return wait_status;
+    }
+
+    if (WIFSIGNALED(wait_status)) {
+        if (report) {
+            std::cout << "[killed] by signal " << WTERMSIG(wait_status) << '\n';
+        }
+        return wait_status;
+    }
+
+    if (WIFSTOPPED(wait_status)) {
+        const auto sig = WSTOPSIG(wait_status);
+        const auto info = get_signal_info();
+
+        switch (sig) {
+        case SIGTRAP:
+            handle_sigtrap(info);
+            break;
+        case SIGSEGV:
+            if (report) {
+                std::cout << "Received SIGSEGV (code " << info.si_code
+                          << ") at address 0x" << std::hex
+                          << reinterpret_cast<std::uintptr_t>(info.si_addr)
+                          << std::dec << '\n';
+            }
+            break;
+        default:
+            if (report) {
+                std::cout << "Stopped by signal " << strsignal(sig) << '\n';
+            }
+            break;
+        }
+    }
+
+    return wait_status;
+}
+```
+waitpid 루프의 중앙 허브, 정지 원인에 따라서 분기한다
+1. waitpid(m_pid, &status, 0)
+2. WIFSTOPPED(status) 면 get_signal_info()
+3. info.si_signo에 따라서
+    - SIGTRAP > handle_sigtrap(info)
+    - SIGSEGV > si_code/주소 로그(옵션으로 메모리 덤프)
+    - 기타 > 로깅
+??????????
+
+```cpp
+void debugger::step_over_breakpoint() {
+    const auto it = m_breakpoints.find(get_pc());
+    if (it == m_breakpoints.end()) {
+        return;
+    }
+
+    auto& bp = it->second;
+    if (!bp.is_enabled()) {
+        return;
+    }
+
+    bp.disable();
+    if (ptrace(PTRACE_SINGLESTEP, m_pid, nullptr, nullptr) == -1) {
+        perror("ptrace(PTRACE_SINGLESTEP)");
+    } else {
+        wait_for_signal(false);
+    }
+    bp.enable();
+}
+```
+히트한 BP를 한번 우회하는 표준 루틴
+BP해제 > PTRACE_SINGLESTEP > 대기 > BP 재설치
+TRAP_BRKPT 처리 중, PC 보정 직후 호출된다
+
+### DWARF/ELF 파싱과 주소 변환
+- 디버거 생성자에서 실행 파일을 `open`한 뒤 libelfin으로 ELF/DWARF 핸들을 만들어 `m_elf`, `m_dwarf`에 저장. 이후 모든 소스/라인 조회에 reuse.
+- `get_function_from_pc(uint64_t pc)`: 현재 PC가 속한 컴파일 유닛(CU)을 찾고, 그 안의 `DW_TAG_subprogram` DIE를 순회해서 해당 함수를 반환. 인라인/멤버 함수 처리도 확장 여지 있음.
+- `get_line_entry_from_pc(uint64_t pc)`: 위와 동일하게 CU를 찾은 뒤 라인 테이블에서 주소에 대응하는 엔트리를 돌려줌. 파일 경로/라인 번호를 얻는 기본 API.
+- `initialize_load_address()`와 `offset_load_address(uint64_t addr)`: PIE/공유 라이브러리라면 `/proc/<pid>/maps`의 첫 매핑 주소를 로드 베이스로 기록하고, 질의할 때 `addr - m_load_address`로 오프셋을 보정.
+
+### 소스 출력
+- `print_source(const std::string&, unsigned, unsigned ctx=2)`: 소스 파일을 열어 현재 라인 주변을 출력하고, 현재 라인 앞에는 `>` 커서를 붙인다. 브레이크포인트·단일 스텝 정지 시 사용.
+
+### 시그널 처리 고도화
+- `get_signal_info()`: `ptrace(PTRACE_GETSIGINFO)`로 직전 신호의 `siginfo_t`를 확보.
+- `wait_for_signal(bool report)`: `waitpid`로 대기 후 `get_signal_info()`를 호출하고, `SIGTRAP`이면 `handle_sigtrap`으로 분기, `SIGSEGV`면 `si_code`/`si_addr`를 출력, 나머지는 `strsignal`로 로깅.
+- `handle_sigtrap(siginfo_t)`: `SI_KERNEL`/`TRAP_BRKPT`에서 PC를 1바이트 되돌리고, 로드 오프셋을 적용한 뒤 `get_line_entry_from_pc` → `print_source`로 현재 소스 컨텍스트를 맞춰 준다. `TRAP_TRACE`는 단일 스텝 완료 케이스.
+- `step_over_breakpoint()`: SIGTRAP 처리에서 PC를 되돌려주므로, 여기서는 브레이크포인트만 잠시 비활성화 → `PTRACE_SINGLESTEP` → 다시 설치하는 역할만 담당.
+
+### 실행 흐름 예시 - SW breakpoint hit
+1. target int3 도달 > SIGTRAP/TRAP_BPKPT 정지
+2. wait_for_signal() > get_signal_info() > handle_sigtrap()
+3. get_pc > set_pc(pc-1) (0xcc 보정)
+4. step_over_breakpoint() 로 원본 바이트를 복구하고 한 스텝 이후 재설치
+5. get_line_entry_from_pc() > print_source() 로 현재 소스 표시
+6. 사용자 입력 루프 (계속/다음 스텝/다른 BP 설정 등...)
+
+
 
 ## 고려해야할 방해 로직들...
 

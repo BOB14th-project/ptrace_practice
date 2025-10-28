@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include <stdexcept>
+#include <fstream>
 
 #include "register.h"
 
@@ -29,10 +30,8 @@ void report_error(const std::exception& ex) {
 } // namespace
 
 void debugger::run() {
-    // Wait for the child to stop on its initial SIGTRAP after execve
-    int wait_status = 0;
-    if (waitpid(m_pid, &wait_status, 0) < 0) {
-        perror("waitpid (initial)");
+    const auto wait_status = wait_for_signal(false);
+    if (wait_status == -1) {
         return;
     }
 
@@ -41,14 +40,19 @@ void debugger::run() {
         return;
     }
 
-    // Set a couple of helpful ptrace options early
+    if (WIFSIGNALED(wait_status)) {
+        std::cerr << "[!] Process received signal " << WTERMSIG(wait_status) << " before we could attach\n";
+        return;
+    }
+
+    initialize_load_address();
+
     long r = ptrace(PTRACE_SETOPTIONS, m_pid, 0,
                     PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD);
     if (r == -1) {
         perror("ptrace(PTRACE_SETOPTIONS)");
     }
 
-    // Simple REPL using std::getline (portable, no extra dependency)
     for (std::string cmdline; std::cout << "minidbg> " && std::getline(std::cin, cmdline);) {
         if (!cmdline.empty()) handle_command(cmdline);
     }
@@ -238,59 +242,48 @@ void debugger::set_pc(uint64_t pc) {
     set_register_value(m_pid, reg::rip, pc);
 }
 
-void debugger::step_over_breakpoint() {
-    const auto possible_breakpoint_location = static_cast<std::intptr_t>(get_pc() - 1);
-
-    const auto it = m_breakpoints.find(possible_breakpoint_location);
-    if (it == m_breakpoints.end()) return;
-
-    auto& bp = it->second;
-    if (!bp.is_enabled()) return;
-
-    const auto previous_instruction_address = static_cast<uint64_t>(possible_breakpoint_location);
-    set_pc(previous_instruction_address);
-
-    bp.disable();
-    if (ptrace(PTRACE_SINGLESTEP, m_pid, nullptr, nullptr) == -1) {
-        perror("ptrace(PTRACE_SINGLESTEP)");
-    } else {
-        wait_for_signal(false);
-    }
-    bp.enable();
-}
-
 int debugger::wait_for_signal(bool report) {
     int wait_status = 0;
-
-    // auto options = 0;
-    // waitpid(m_pid, &wait_status, options);
-
-    // auto siginfo = get_signal_info();
-
-    // switch (siginfo.si_signo) {
-    // case SIGTRAP:
-    //     handle_sigtrap(siginfo);
-    //     break;
-    // case SIGSEGV:
-    //     std::cout << "Yay, segfault. Reason: " << siginfo.si_code << std::endl;
-    //     break;
-    // default:
-    //     std::cout << "Got signal " << strsignal(siginfo.si_signo) << std::endl;
-    // }
-
     if (waitpid(m_pid, &wait_status, 0) < 0) {
         perror("waitpid");
         return -1;
     }
 
-    if (report) {
-        if (WIFSTOPPED(wait_status)) {
-            const auto sig = WSTOPSIG(wait_status);
-            std::cout << "[stopped] signal " << sig << '\n';
-        } else if (WIFEXITED(wait_status)) {
+    if (WIFEXITED(wait_status)) {
+        if (report) {
             std::cout << "[exit] status " << WEXITSTATUS(wait_status) << '\n';
-        } else if (WIFSIGNALED(wait_status)) {
+        }
+        return wait_status;
+    }
+
+    if (WIFSIGNALED(wait_status)) {
+        if (report) {
             std::cout << "[killed] by signal " << WTERMSIG(wait_status) << '\n';
+        }
+        return wait_status;
+    }
+
+    if (WIFSTOPPED(wait_status)) {
+        const auto sig = WSTOPSIG(wait_status);
+        const auto info = get_signal_info();
+
+        switch (sig) {
+        case SIGTRAP:
+            handle_sigtrap(info);
+            break;
+        case SIGSEGV:
+            if (report) {
+                std::cout << "Received SIGSEGV (code " << info.si_code
+                          << ") at address 0x" << std::hex
+                          << reinterpret_cast<std::uintptr_t>(info.si_addr)
+                          << std::dec << '\n';
+            }
+            break;
+        default:
+            if (report) {
+                std::cout << "Stopped by signal " << strsignal(sig) << '\n';
+            }
+            break;
         }
     }
 
@@ -317,79 +310,94 @@ dwarf::line_table::iterator debugger::get_line_entry_from_pc(uint64_t pc) {
         if (die_pc_range(cu.root()).contains(pc)) {
             auto& lt = cu.get_line_table();
             auto it = lt.find_address(pc);
-            if (it != lt.end()) {
+            if (it == lt.end()) {
                 throw std::out_of_range{"Cannot find line entry"};
             }
-            else {
-                return it;
-            }
+            return it;
         }
     }
     throw std::out_of_range{"Cannot find line entry"};
 }
 
-void debugger::run(){
-    wait_for_signal();
-    initialize_load_address();
-}
-
 void debugger::initialize_load_address() {
-    // If this is a dynamic library (e.g PIE)
-    if (m_elf.get_hdr().type == elf::et::dyn){
-        // the load address is found in /proc/<pid>/maps
-        std::ifstream map("/proc/" + std::to_string(m_pid) + "/maps");
+    m_load_address = 0;
 
-        //read the first address from the file
-        // ASLR 껐다고 가정하고 있는것으로 보임
-        std::string addr;
-        std::getline(map, addr, '-');
+    if (m_elf.get_hdr().type != elf::et::dyn) {
+        return;
+    }
 
-        m_load_address = std::stol(addr, 0, 16);
+    std::ifstream map("/proc/" + std::to_string(m_pid) + "/maps");
+    if (!map) {
+        report_error("failed to open /proc/" + std::to_string(m_pid) + "/maps");
+        return;
+    }
+
+    std::string addr;
+    if (std::getline(map, addr, '-')) {
+        try {
+            m_load_address = std::stoull(addr, nullptr, 16);
+        } catch (const std::exception& ex) {
+            report_error(std::string("failed to parse load address: ") + ex.what());
+        }
+    } else {
+        report_error("unexpected format while reading load address");
     }
 }
 
-uint64_t debugger::offset_load_address(uint64_t addr) {
+uint64_t debugger::offset_load_address(uint64_t addr) const {
+    if (m_load_address == 0 || addr < m_load_address) {
+        return addr;
+    }
     return addr - m_load_address;
 }
 
 void debugger::print_source(const std::string& file_name, unsigned line, unsigned n_lines_context){
-    std::ifstream file {file_name};
+    std::ifstream file{file_name};
+    if (!file) {
+        report_error("failed to open source file: " + file_name);
+        return;
+    }
 
-    //Work out a window around the desired line
+    // Work out a window around the desired line
     auto start_line = line <= n_lines_context ? 1 : line - n_lines_context;
     auto end_line = line + n_lines_context + (line < n_lines_context ? n_lines_context - line : 0) + 1;
 
     char c{};
     auto current_line = 1u;
-    //skip lines up until start_line
-    while (current_line != start_line && file.get(c)){
-        if (c == '\n'){
+    // Skip lines up until start_line
+    while (current_line != start_line && file.get(c)) {
+        if (c == '\n') {
             ++current_line;
         }
     }
 
-    //output cursor if we are at the current line
+    if (current_line > end_line) {
+        return;
+    }
+
     std::cout << (current_line == line ? "> " : "  ");
 
-    //write lines up until end_line
+    // Write lines up until end_line
     while (current_line <= end_line && file.get(c)) {
         std::cout << c;
         if (c == '\n') {
             ++current_line;
-            //output cursor if we are at the current line
+            // Output cursor if we are at the current line
             std::cout << (current_line == line ? "> " : "  ");
         }
     }
 
-    // write newline and make sure that the stream is flushed properly
     std::cout << std::endl;
 }
 
 siginfo_t debugger::get_signal_info() {
-    siginfo_t info;
-    ptrace(PTRACE_GETSIGINFO, m_pid, nullptr, &info);
+    siginfo_t info{};
+    if (ptrace(PTRACE_GETSIGINFO, m_pid, nullptr, &info) == -1) {
+        perror("ptrace(PTRACE_GETSIGINFO)");
+        std::memset(&info, 0, sizeof(info));
+    }
     return info;
-} 
+}
 
 void debugger::handle_sigtrap(siginfo_t info) {
     switch (info.si_code) {
@@ -397,11 +405,17 @@ void debugger::handle_sigtrap(siginfo_t info) {
     case SI_KERNEL:
     case TRAP_BRKPT:
     {
-        set_pc(get_pc()-1); //put the pc back where it should be
-        std::cout << "Hit breakpoint at address 0x" << std::hex << get_pc() << std::endl;
-        auto offset_pc = offset_load_address(get_pc()); //rember to offset the pc for querying DWARF
-        auto line_entry = get_line_entry_from_pc(offset_pc);
-        print_source(line_entry->file->path, line_entry->line);
+        const auto pc = get_pc() - 1;
+        set_pc(pc); // put the pc back where it should be
+        std::cout << "Hit breakpoint at address 0x" << std::hex << pc << std::dec << '\n';
+
+        const auto offset_pc = offset_load_address(pc);
+        try {
+            auto line_entry = get_line_entry_from_pc(offset_pc);
+            print_source(line_entry->file->path, line_entry->line, 2);
+        } catch (const std::exception& ex) {
+            report_error(std::string("failed to print source: ") + ex.what());
+        }
         return;
     }
     //this will be set if the signal was sent by single stepping
@@ -414,13 +428,21 @@ void debugger::handle_sigtrap(siginfo_t info) {
 }
 
 void debugger::step_over_breakpoint() {
-    if (m_breakpoints.count(get_pc())) {
-        auto& bp = m_breakpoints[get_pc()];
-        if (bp.is_enabled()) {
-            bp.disable();
-            ptrace(PTRACE_SINGLESTEP, m_pid, nullptr, nullptr);
-            wait_for_signal();
-            bp.enable();
-        }
+    const auto it = m_breakpoints.find(get_pc());
+    if (it == m_breakpoints.end()) {
+        return;
     }
+
+    auto& bp = it->second;
+    if (!bp.is_enabled()) {
+        return;
+    }
+
+    bp.disable();
+    if (ptrace(PTRACE_SINGLESTEP, m_pid, nullptr, nullptr) == -1) {
+        perror("ptrace(PTRACE_SINGLESTEP)");
+    } else {
+        wait_for_signal(false);
+    }
+    bp.enable();
 }
