@@ -427,6 +427,7 @@ BP 해제 → `PTRACE_SINGLESTEP` → 재대기 → BP 재설치 순서로 진�
 - `break 0xADDR`도 그대로 유지되지만, PIE 바이너리에서도 자동으로 로드 베이스를 빼주는 덕분에 동일한 커맨드로 사용 가능하다.
 - `symbol <name>` 명령을 추가해 `.symtab`/`.dynsym`를 순회하며 일치하는 심볼 정보를 나열한다. 새로 도입한 `lookup_symbol()`이 `symbol_type`·`to_symbol_type()` 헬퍼와 함께 이 기능을 담당한다.
 - 헤더에는 함수/라인 브레이크포인트와 심볼 조회용 멤버 선언을 추가해 구현부와 인터페이스가 맞춰졌다.
+- 외부 의존성 없이 쓰려고 `third_party/libelfin`에 libelfin 헤더(`dwarf/*.hh`, `elf/*.hh`)와 정적 라이브러리(`libdwarf++.a`, `libelf++.a`)를 포함했다. 빌드할 때는 `-I../third_party/libelfin/include/dwarf -I../third_party/libelfin/include/elf -L../third_party/libelfin/lib -ldwarf++ -lelf++` 옵션을 추가하면 된다.
 
 ## 고려해야할 방해 로직들...
 
@@ -444,3 +445,7 @@ BP 해제 → `PTRACE_SINGLESTEP` → 재대기 → BP 재설치 순서로 진�
 - 즉, API 후킹으로 잡히지 않는 커스텀 암호화 루틴만 디버거로 뜯어보면 된다면, 디버거 회피 로직 추가 여부만 살펴보고 나머지는 과감히 무시해도 괜찮습니다.
 
 먼저 함수 후킹으로 api콜하는거를 잡아내고 직접 구현된 암호화만 이걸로 포착하고 있으니까 몇가지 케이스는 덜 고려해도 되는거 아닌가... 개인적인 생각
+
+## Third-party notice
+
+- `third_party/libelfin`은 [aclements/libelfin](https://github.com/aclements/libelfin)에서 가져온 파일이며 MIT License를 따른다. 하위 디렉터리에 라이선스 사본을 함께 포함했다.

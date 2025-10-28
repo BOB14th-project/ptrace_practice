@@ -27,9 +27,16 @@ void report_error(const std::exception& ex) {
     report_error(ex.what());
 }
 
+bool is_suffix(const std::string& suffix, const std::string& full) {
+    if (suffix.size() > full.size()) {
+        return false;
+    }
+    return std::equal(suffix.rbegin(), suffix.rend(), full.rbegin());
+}
+
 uint64_t die_attribute_as_address(const dwarf::die& die, dwarf::DW_AT attr) {
     const auto value = die[attr];
-    if (!value) {
+    if (!value.valid()) {
         throw std::out_of_range{"missing DWARF attribute"};
     }
 
@@ -44,13 +51,13 @@ uint64_t die_attribute_as_address(const dwarf::die& die, dwarf::DW_AT attr) {
     }
 }
 
-uint64_t at_low_pc(const dwarf::die& die) {
+uint64_t die_low_pc(const dwarf::die& die) {
     return die_attribute_as_address(die, dwarf::DW_AT::low_pc);
 }
 
-uint64_t at_high_pc(const dwarf::die& die) {
+uint64_t die_high_pc(const dwarf::die& die) {
     const auto attr = die[dwarf::DW_AT::high_pc];
-    if (!attr) {
+    if (!attr.valid()) {
         throw std::out_of_range{"missing high_pc attribute"};
     }
 
@@ -59,7 +66,7 @@ uint64_t at_high_pc(const dwarf::die& die) {
     case value::type::address:
         return attr.as_address();
     case value::type::constant:
-        return at_low_pc(die) + attr.as_uconstant();
+        return die_low_pc(die) + attr.as_uconstant();
     default:
         throw std::runtime_error{"unsupported high_pc encoding"};
     }
@@ -624,8 +631,8 @@ void debugger::step_over(){
         return;
     }
 
-    const auto func_entry = at_low_pc(func);
-    const auto func_end = at_high_pc(func);
+    const auto func_entry = die_low_pc(func);
+    const auto func_end = die_high_pc(func);
 
     uint64_t start_address = 0;
     try {
@@ -673,7 +680,7 @@ void debugger::set_breakpoint_at_function(const std::string& name) {
     for (const auto& cu : m_dwarf.compilation_units()) {
         for (const auto& die : cu.root()) {
             if (die.has(dwarf::DW_AT::name) && at_name(die) == name) {
-                auto low_pc = at_low_pc(die);
+                auto low_pc = die_low_pc(die);
                 auto entry = get_line_entry_from_pc(low_pc);
                 ++entry; //skip prologue
                 set_breakpoint_at_address(offset_dwarf_address(entry->address));
