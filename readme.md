@@ -458,23 +458,52 @@ bye
 
 ```cpp
 void debugger::print_backtrace() {
-    auto output_frame = [frame_number = 0] (auto&& func) mutable {
-        std::cout << "frame #" << frame_number++ << ": 0x" << dwarf::at_low_pc(func)
-                  << ' ' << dwarf::at_name(func) << std::endl;
-    };
+    std::ios_base::fmtflags original_flags{std::cout.flags()};
+    try {
+        constexpr std::size_t max_frames = 64;
+        std::size_t frame_index = 0;
 
-    auto current_func = get_function_from_pc(get_pc());
-    output_frame(current_func);
+        auto current_pc = get_pc();
+        auto frame_pointer = get_register_value(m_pid, reg::rbp);
 
-    auto frame_pointer = get_register_value(m_pid, reg::rbp);
-    auto return_address = read_memory(frame_pointer+8);
+        while (frame_index < max_frames) {
+            const auto func = get_function_from_pc(offset_load_address(current_pc));
+            const auto link_addr = dwarf::at_low_pc(func);
+            const auto runtime_addr = offset_dwarf_address(link_addr);
+            std::string func_name;
+            try {
+                func_name = dwarf::at_name(func);
+            } catch (...) {
+                func_name.clear();
+            }
 
-    while (dwarf::at_name(current_func) != "main") {
-        current_func = get_function_from_pc(return_address);
-        output_frame(current_func);
-        frame_pointer = read_memory(frame_pointer);
-        return_address = read_memory(frame_pointer+8);
+            std::cout << "frame #" << frame_index++ << ": 0x"
+                      << std::hex << runtime_addr << std::dec << ' '
+                      << (func_name.empty() ? "<unknown>" : func_name) << '\n';
+
+            if (func_name == "main" || frame_pointer == 0) {
+                break;
+            }
+
+            const auto return_address = read_memory(frame_pointer + sizeof(uint64_t));
+            if (return_address == 0) {
+                break;
+            }
+
+            const auto next_frame = read_memory(frame_pointer);
+            if (next_frame == 0 || next_frame <= frame_pointer) {
+                break;
+            }
+
+            frame_pointer = next_frame;
+            current_pc = return_address - 1;
+        }
+    } catch (const std::out_of_range&) {
+        // Unwinding reached code without DWARF coverage.
+    } catch (const std::exception& ex) {
+        report_error(std::string("backtrace failed: ") + ex.what());
     }
+    std::cout.flags(original_flags);
 }
 ```
 
@@ -504,7 +533,7 @@ minidbg> cont
 minidbg> quit
 bye
 ```
-결과. quit 이후 문제생기는것까지 수정
+출력 주소는 이제 실행 시점 주소(ASLR 보정 적용)로 나온다. `main`까지 올라가거나 프레임 포인터 체인이 끊기면 자동으로 멈추며, 최악의 경우 예외를 잡아 사용자에게 보고한다. 이전에 `quit` 직후 스택 가드가 깨지던 문제도 더 이상 재현되지 않았다. (백트레이스만 보고 싶다면 `cont` 하지 말고 `bt` 이후 `quit`로 종료하면 된다.)
 
 ## 고려해야할 방해 로직들...
 
