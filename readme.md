@@ -566,6 +566,11 @@ minidbg>
 
 ## 10. advanced_topics
 
+- **Remote debugging**: 디버거 ↔ 디버그 스텁 ↔ 트레이시 구조. GDB 원격 프로토콜(`$Z0,<addr>,<kind>#<checksum>` 등)로 명령을 주고받으며, IDE/MI 계층과도 연동 가능하다.
+- **공유 라이브러리 추적**: ELF `PT_DYNAMIC`/`.dynamic` 기반 rendezvous 구조를 찾아 현재 로드된 so 목록을 읽고, 업데이트 훅에 브레이크포인트를 걸어 `dlopen`/`dlclose`를 감시한다.
+- **식 평가**: 단순 식은 DWARF 변수 조회, 복잡한 식은 IR 해석이나 JIT 실행이 필요하다. LLDB는 Clang→LLVM IR→인터프리트, 혹은 mmap한 코드 블록을 실행해 결과를 얻는다.
+- **멀티스레드 지원**: `PTRACE_SETOPTIONS`에 `PTRACE_O_TRACECLONE`을 설정해 새 스레드 TID를 받아 `/proc/<pid>/task`에서 상태를 추적한다. GDB는 `libthread_db`로 이 과정을 추상화한다.
+- 현재 구현에는 적용되지 않았지만, 향후 원격 스텁·동적 로딩 모니터·식 평가 엔진·스레드 스케줄러를 붙일 때 참고할 개념 정리.
 
 ## 고려해야할 방해 로직들...
 
