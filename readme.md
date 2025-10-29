@@ -429,6 +429,31 @@ BP 해제 → `PTRACE_SINGLESTEP` → 재대기 → BP 재설치 순서로 진�
 - 헤더에는 함수/라인 브레이크포인트와 심볼 조회용 멤버 선언을 추가해 구현부와 인터페이스가 맞춰졌다.
 - 외부 의존성 없이 쓰려고 `third_party/libelfin`에 libelfin 헤더(`dwarf/*.hh`, `elf/*.hh`)와 정적 라이브러리(`libdwarf++.a`, `libelf++.a`)를 포함했다. 빌드할 때는 `-I../third_party/libelfin/include/dwarf -I../third_party/libelfin/include/elf -L../third_party/libelfin/lib -ldwarf++ -lelf++` 옵션을 추가하면 된다.
 
+### test
+
+```bash
+➜  07.source_level_breakpoints git:(master) ✗ ./minidbg ./target2
+Unknown SIGTRAP code 0
+minidbg> break d
+Set breakpoint at address 0x555555555187
+minidbg> cont
+Hit breakpoint at address 0x555555555187
+
+  void d() {
+>     int foo = 4;
+      c();
+  }
+
+
+minidbg> cont
+[exit] status 0
+minidbg> quit
+bye
+*** stack smashing detected ***: terminated
+[1]    9955 IOT instruction (core dumped)  ./minidbg ./target2
+```
+잘 되는 것으로 보인다
+
 ## 고려해야할 방해 로직들...
 
 - ptrace 감지/배제: ptrace(PTRACE_TRACEME) 재호출, getppid() 체크, /proc/self/status의 TracerPid 확인 등으로 디버거 존재를 감지해 종료하거나 기능을 바꿉니다.

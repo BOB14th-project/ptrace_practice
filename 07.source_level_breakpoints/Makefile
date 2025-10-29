@@ -3,12 +3,12 @@ CC  := gcc
 
 LIBELFIN_DIR := ../third_party/libelfin
 
-CXXFLAGS := -std=c++17 -g -Wall -Wextra \
+CXXFLAGS := -std=c++17 -g -gdwarf-4 -Wall -Wextra \
     -I$(LIBELFIN_DIR)/include/dwarf \
     -I$(LIBELFIN_DIR)/include/elf
 LDFLAGS := -L$(LIBELFIN_DIR)/lib -ldwarf++ -lelf++
 
-CFLAGS := -g -Wall -Wextra
+CFLAGS := -g -gdwarf-4 -Wall -Wextra
 
 MINIDBG_SRCS := minidbg.cpp debugger.cpp breakpoint.cpp register.cpp pch.cpp
 MINIDBG_OBJS := $(MINIDBG_SRCS:.cpp=.o)

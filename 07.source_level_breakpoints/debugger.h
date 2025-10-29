@@ -101,4 +101,5 @@ private:
     elf::elf m_elf;
     dwarf::dwarf m_dwarf;
     uint64_t m_load_address{0};
+    bool m_should_exit{false};
 };

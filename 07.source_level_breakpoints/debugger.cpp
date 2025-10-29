@@ -99,7 +99,12 @@ void debugger::run() {
     }
 
     for (std::string cmdline; std::cout << "minidbg> " && std::getline(std::cin, cmdline);) {
-        if (!cmdline.empty()) handle_command(cmdline);
+        if (!cmdline.empty()) {
+            handle_command(cmdline);
+            if (m_should_exit) {
+                break;
+            }
+        }
     }
 }
 
@@ -113,23 +118,12 @@ void debugger::handle_command(const std::string& line) {
         return;
     }
 
-    if (command == "break" || command == "b") {
-        if (args.size() < 2) {
-            report_error("Usage: break <address>");
-            return;
-        }
-        try {
-            auto addr = static_cast<std::intptr_t>(parse_integer(args[1]));
-            set_breakpoint_at_address(addr);
-        } catch (const std::exception& ex) {
-            report_error(ex);
-        }
-        return;
-    }
-
     if (command == "quit" || command == "q") {
         std::cout << "bye\n";
-        kill(m_pid, SIGKILL);
+        if (kill(m_pid, SIGKILL) == -1 && errno != ESRCH) {
+            perror("kill");
+        }
+        m_should_exit = true;
         return;
     }
 
@@ -236,17 +230,26 @@ void debugger::handle_command(const std::string& line) {
         return;
     }
 
-    if (is_prefix(command, "break")){
-        if (args[1][0] == '0' && args[1][1] == 'x') {
-            std::string addr {args[1], 2};
-            set_breakpoint_at_address(std::stol(addr, 0, 16));
+    if (command == "break" || command == "b") {
+        if (args.size() < 2) {
+            report_error("Usage: break <address|file:line|function>");
+            return;
         }
-        else if (args[1].find(':') != std::string::npos) {
-            auto file_and_line = split(args[1], ':');
-            set_breakpoint_at_source_line(file_and_line[0], std::stoi(file_and_line[1]));
-        }
-        else {
-            set_breakpoint_at_function(args[1]);
+        const auto& spec = args[1];
+        try {
+            if (spec.size() > 2 && spec[0] == '0' && (spec[1] == 'x' || spec[1] == 'X')) {
+                set_breakpoint_at_address(static_cast<std::intptr_t>(parse_integer(spec)));
+            } else if (spec.find(':') != std::string::npos) {
+                const auto file_and_line = split(spec, ':');
+                if (file_and_line.size() != 2) {
+                    throw std::invalid_argument("invalid file:line breakpoint specifier");
+                }
+                set_breakpoint_at_source_line(file_and_line[0], std::stoi(file_and_line[1]));
+            } else {
+                set_breakpoint_at_function(spec);
+            }
+        } catch (const std::exception& ex) {
+            report_error(ex);
         }
         return;
     }
