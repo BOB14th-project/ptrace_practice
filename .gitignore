@@ -6,3 +6,4 @@
 minidbg
 target
 target2
+*.o
