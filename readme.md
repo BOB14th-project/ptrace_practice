@@ -452,7 +452,7 @@ bye
 *** stack smashing detected ***: terminated
 [1]    9955 IOT instruction (core dumped)  ./minidbg ./target2
 ```
-잘 되는 것으로 보인다
+잘 되는 것으로 보인다. quit 이후 문제생기는것은 지금은 고치지 않고 넘어간다.
 
 ## 08.stack_unwinding
 
@@ -477,6 +477,34 @@ void debugger::print_backtrace() {
     }
 }
 ```
+
+```bash
+➜  08.stack_unwinding git:(master) ✗ ./minidbg ./target2
+Unknown SIGTRAP code 0
+minidbg> break b
+Set breakpoint at address 0x555555555147
+minidbg> cont
+Hit breakpoint at address 0x555555555147
+
+  void b() {
+>     int foo = 2;
+      a();
+  }
+
+
+minidbg> bt
+frame #0: 0x55555555513b b
+frame #1: 0x55555555515b c
+frame #2: 0x55555555517b d
+frame #3: 0x55555555519b e
+frame #4: 0x5555555551bb f
+frame #5: 0x5555555551db main
+minidbg> cont
+[exit] status 0
+minidbg> quit
+bye
+```
+결과. quit 이후 문제생기는것까지 수정
 
 ## 고려해야할 방해 로직들...
 

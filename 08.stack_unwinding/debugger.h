@@ -88,6 +88,7 @@ private:
     void initialize_load_address();
     uint64_t offset_load_address(uint64_t addr) const;
     void print_source(const std::string& file_name, unsigned line, unsigned n_lines_context = 2);
+    void print_backtrace();
     siginfo_t get_signal_info();
     void handle_sigtrap(siginfo_t info);
 
