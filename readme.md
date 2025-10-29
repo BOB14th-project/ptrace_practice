@@ -535,6 +535,38 @@ bye
 ```
 출력 주소는 이제 실행 시점 주소(ASLR 보정 적용)로 나온다. `main`까지 올라가거나 프레임 포인터 체인이 끊기면 자동으로 멈추며, 최악의 경우 예외를 잡아 사용자에게 보고한다. 이전에 `quit` 직후 스택 가드가 깨지던 문제도 더 이상 재현되지 않았다. (백트레이스만 보고 싶다면 `cont` 하지 말고 `bt` 이후 `quit`로 종료하면 된다.)
 
+## 09.handling_variables
+
+- `vars`, `p <name>` 명령을 추가해 현재 프레임의 지역 변수/인자를 읽는다. DW_OP_fbreg, DW_OP_breg*, DW_OP_reg*, DW_OP_addr, 상수/stack_value 정도만 해석하는 가벼운 위치식 인터프리터를 직접 붙였다.
+- 함수의 `DW_AT_frame_base`가 `DW_OP_call_frame_cfa`인 경우에는 `rbp + 16`(리턴 주소/old rbp를 뛰어넘는 포인터 크기 × 2)으로 CFA를 잡고, 그 외에는 기본적으로 `rbp`로 폴백한다.
+- 변수 타입 크기는 `DW_AT_byte_size`나 포인터/참조 태그로 계산한다. 정보가 없으면 포인터 크기(8바이트)만큼 읽도록 했다.
+- 메모리 덤프는 리틀엔디언 바이트를 뒤집어 `0x00112233` 형태로 출력한다.
+- 현재는 loclist, piece, 레지스터 조합 같은 고급 규칙은 미지원이라 O2 이상 최적화된 바이너리에서는 일부 변수를 못 잡을 수 있다.
+
+```bash
+➜  09.handling_variables ./minidbg ./target2
+Unknown SIGTRAP code 0
+minidbg> break c
+Set breakpoint at address 0x555555555163
+minidbg> cont
+Hit breakpoint at address 0x555555555163
+
+  void c() {
+>     int foo = 3;
+      b();
+  }
+
+
+minidbg> vars
+foo = 0x00000003
+minidbg> p foo
+foo = 0x00000003
+minidbg>
+```
+
+## 10. advanced_topics
+
+
 ## 고려해야할 방해 로직들...
 
 - ptrace 감지/배제: ptrace(PTRACE_TRACEME) 재호출, getppid() 체크, /proc/self/status의 TracerPid 확인 등으로 디버거 존재를 감지해 종료하거나 기능을 바꿉니다.
